@@ -126,11 +126,12 @@ func (q QobuzConfig) IsSet() bool {
 // If no client_id/client_secret are set, built-in fallback credentials are
 // used automatically (same pattern as Spotify).
 type YouTubeMusicConfig struct {
-	Disabled     bool   // true only when user explicitly sets enabled = false
-	Enabled      bool   // true when [ytmusic] section exists (even without credentials)
-	ClientID     string // Google Cloud OAuth2 client ID (overrides built-in fallback)
-	ClientSecret string // Google Cloud OAuth2 client secret (overrides built-in fallback)
-	CookiesFrom  string // browser name for yt-dlp --cookies-from-browser (e.g. "chrome", "firefox")
+	Disabled       bool   // true only when user explicitly sets enabled = false
+	Enabled        bool   // true when [ytmusic] section exists (even without credentials)
+	ClientID       string // Google Cloud OAuth2 client ID (overrides built-in fallback)
+	ClientSecret   string // Google Cloud OAuth2 client secret (overrides built-in fallback)
+	CookiesFrom    string // browser name for yt-dlp --cookies-from-browser (e.g. "chrome", "firefox")
+	ExpandPlaylist *bool  // nil = default (true), controls whether list= URLs expand the full playlist
 }
 
 // IsSetOrFallback returns true when YouTube providers should be enabled,
@@ -406,6 +407,9 @@ func Load() (Config, error) {
 				cfg.YouTubeMusic.ClientSecret = parseString(val)
 			case "cookies_from":
 				cfg.YouTubeMusic.CookiesFrom = parseString(val)
+			case "expand_playlist":
+				v := strings.ToLower(val) != "false"
+				cfg.YouTubeMusic.ExpandPlaylist = &v
 			}
 		case "plex":
 			switch key {

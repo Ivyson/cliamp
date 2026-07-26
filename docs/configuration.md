@@ -134,6 +134,8 @@ token = "${EMBY_TOKEN}"
 [ytmusic]
 client_id = "${YTMUSIC_CLIENT_ID}"
 client_secret = "${YTMUSIC_CLIENT_SECRET}"
+# Optional: resolve full playlists from list= URLs (default true). Set to false to strip playlist params.
+# expand_playlist = true
 ```
 
 Rules:

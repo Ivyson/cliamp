@@ -20,6 +20,7 @@ type Overrides struct {
 	Playlist        *string
 	LogLevel        *string
 	LowPower        *bool
+	ExpandPlaylist  *bool
 }
 
 // Apply merges non-nil overrides into cfg and clamps the result.
@@ -77,6 +78,9 @@ func (o Overrides) Apply(cfg *Config) {
 	}
 	if o.LowPower != nil {
 		cfg.LowPower = *o.LowPower
+	}
+	if o.ExpandPlaylist != nil {
+		cfg.YouTubeMusic.ExpandPlaylist = o.ExpandPlaylist
 	}
 	cfg.clamp()
 }

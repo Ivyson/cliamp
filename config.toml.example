@@ -161,6 +161,22 @@ eq = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 # user_id = "optional-user-id"
 
 # ---
+# YouTube Music (optional)
+# Built-in fallback credentials work for most users — no config needed.
+# Set your own Google Cloud OAuth client to avoid shared rate limits:
+#
+# [ytmusic]
+# client_id = "your-google-oauth-client-id"
+# client_secret = "your-google-oauth-client-secret"
+#
+# Browser cookies for age-restricted / private content:
+# cookies_from = "chrome"
+#
+# Resolve full playlists from list= URLs (default true).
+# When false, only the single video is resolved and playlist links are stripped.
+# expand_playlist = true
+
+# ---
 # Emby server (optional)
 # Authenticate either with an API key or with your username/password.
 # user_id is optional and is discovered automatically when omitted.

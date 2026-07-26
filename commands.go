@@ -44,6 +44,8 @@ func buildApp() *cli.Command {
 		&cli.StringFlag{Name: "audio-device", Usage: "audio output device (use 'list' to show)"},
 		&cli.StringFlag{Name: "playlist", Usage: "load a local TOML playlist by name and start playing"},
 		&cli.StringFlag{Name: "log-level", Usage: "log level: debug, info, warn, error"},
+		&cli.BoolFlag{Name: "expand-playlist", Usage: "expand YouTube Music playlists from list= URLs"},
+		&cli.BoolFlag{Name: "no-expand-playlist", Usage: "disable playlist expansion for YouTube Music URLs"},
 		&cli.BoolFlag{Name: "low-power", Usage: "low-power mode: reduce CPU by lowering UI cadence and disabling visualization"},
 		&cli.BoolFlag{Name: "daemon", Aliases: []string{"d"}, Usage: "run headless (no TUI), serving IPC for scripts/Waybar"},
 	}
@@ -204,6 +206,14 @@ func overridesFromFlags(c *cli.Command) (config.Overrides, error) {
 	if c.IsSet("low-power") {
 		v := c.Bool("low-power")
 		ov.LowPower = &v
+	}
+	if c.IsSet("expand-playlist") {
+		v := true
+		ov.ExpandPlaylist = &v
+	}
+	if c.IsSet("no-expand-playlist") {
+		v := false
+		ov.ExpandPlaylist = &v
 	}
 	return ov, nil
 }

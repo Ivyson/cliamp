@@ -47,6 +47,15 @@ client_secret = "your_client_secret_here"
 cookies_from = "chrome"
 ```
 
+Optional: control whether `list=` URLs expand the full playlist or resolve as a single video:
+
+```toml
+[ytmusic]
+expand_playlist = false
+```
+
+When `expand_playlist` is `true` (default), URLs with a `list=` parameter — like auto-generated mixes (RDAMVM, RDMM), album playlists (OLAK), or custom playlists (PL) — are resolved incrementally: the first 20 tracks load instantly so playback starts quickly, while the remaining tracks are fetched in background batches. Set to `false` (or pass `--no-expand-playlist`) to strip the playlist parameter and resolve only the single video.
+
 Supported browsers: `chrome`, `firefox`, `brave`, `edge`, `opera`, `safari`, `chromium`.
 
 You can also point at a specific profile or path using yt-dlp's `browser:path` syntax. For example, Zen browser (a Firefox fork) stores its profile outside the default location:

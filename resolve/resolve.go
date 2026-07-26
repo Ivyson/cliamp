@@ -30,6 +30,11 @@ import (
 	"github.com/kkdai/youtube/v2"
 )
 
+// ExpandYTPlaylist controls whether YouTube (Music) URLs with a list=
+// parameter expand the full playlist or resolve as a single video.
+// Default true preserves backward compatibility.
+var ExpandYTPlaylist = true
+
 // ytdlCookiesFromVal stores the browser name passed to yt-dlp's
 // --cookies-from-browser flag. atomic.Value allows lock-free reads on the
 // resolve hot path while permitting late binding from main.go.
@@ -141,13 +146,44 @@ func Remote(urls []string) ([]playlist.Track, error) {
 		case playlist.IsYouTubeMusicURL(u):
 			// YouTube Music requires yt-dlp; the native YouTube API client
 			// does not support music.youtube.com playlists.
-			t, err := resolveYTDL(u)
-			if err != nil {
-				return nil, fmt.Errorf("resolving youtube music %s: %w", u, err)
+			//
+			// When the URL has a playlist (list=), fetch only the first
+			// YTDLRadioInitialItems tracks so the UI can start playing
+			// quickly. The UI's incremental batch loader will fetch the
+			// remaining tracks in the background. If the playlist fetch
+			// fails (e.g. auto-generated mix timed out), fall back to
+			// the single video.
+			target := u
+			if !ExpandYTPlaylist {
+				target = stripPlaylistParam(u)
+				t, err := resolveYTDL(target)
+				if err != nil {
+					return nil, fmt.Errorf("resolving youtube music %s: %w", u, err)
+				}
+				tracks = append(tracks, t...)
+			} else if hasListParam(u) {
+				t, err := resolveYTDL(target, YTDLRadioInitialItems)
+				if err != nil {
+					target = stripPlaylistParam(u)
+					t, err = resolveYTDL(target)
+				}
+				if err != nil {
+					return nil, fmt.Errorf("resolving youtube music %s: %w", u, err)
+				}
+				tracks = append(tracks, t...)
+			} else {
+				t, err := resolveYTDL(target)
+				if err != nil {
+					return nil, fmt.Errorf("resolving youtube music %s: %w", u, err)
+				}
+				tracks = append(tracks, t...)
 			}
-			tracks = append(tracks, t...)
 		case playlist.IsYouTubeURL(u):
-			t, err := resolveYouTube(u)
+			target := u
+			if !ExpandYTPlaylist {
+				target = stripPlaylistParam(u)
+			}
+			t, err := resolveYouTube(target)
 			if err != nil {
 				return nil, fmt.Errorf("resolving youtube %s: %w", u, err)
 			}
@@ -204,6 +240,32 @@ func URL(rawURL string) ([]playlist.Track, error) {
 		tracks = append(tracks, remote...)
 	}
 	return tracks, nil
+}
+
+// stripPlaylistParam removes the list= query parameter from a URL, returning
+// the original URL unchanged if no list parameter is present. Used when
+// ExpandYTPlaylist is false to resolve a single video instead of the playlist.
+func stripPlaylistParam(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	q := u.Query()
+	if q.Get("list") == "" {
+		return rawURL
+	}
+	q.Del("list")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// hasListParam reports whether the URL contains a non-empty list= query parameter.
+func hasListParam(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return u.Query().Get("list") != ""
 }
 
 // sniffFeedURL does a HEAD request and returns true if the Content-Type

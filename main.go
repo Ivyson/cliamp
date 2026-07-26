@@ -199,6 +199,10 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
 		positional = []string{prefix + query}
 	}
 
+	if cfg.YouTubeMusic.ExpandPlaylist != nil {
+		resolve.ExpandYTPlaylist = *cfg.YouTubeMusic.ExpandPlaylist
+	}
+
 	resolved, err := resolve.Args(positional)
 	if err != nil {
 		return err
