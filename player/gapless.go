@@ -11,14 +11,14 @@ import (
 // transitions. It sits at the bottom of the audio pipeline and manages
 // track sources while the EQ/volume/tap/ctrl chain above it lives forever.
 //
-// It always returns (len(samples), true) — it never stops the speaker.
+// It always returns (len(samples), true) --  it never stops the speaker.
 // When no audio is available, it fills silence.
 type gaplessStreamer struct {
 	mu      sync.Mutex
 	current beep.Streamer // active track (decoded + resampled)
 	next    beep.Streamer // preloaded next track
 	drained atomic.Bool   // true when current exhausts with no next
-	onSwap  func()        // called (in goroutine) on gapless transition
+	onSwap  func()        // called on gapless transition (under the speaker lock)
 }
 
 // Stream reads samples from the current track. On exhaustion, it seamlessly
@@ -52,9 +52,15 @@ func (g *gaplessStreamer) Stream(samples [][2]float64) (int, bool) {
 				filled, _ := next.Stream(samples[n:])
 				n += filled
 			}
-			// Notify about the transition (non-blocking)
+			// Commit the transition bookkeeping synchronously. Stream runs on
+			// the audio thread under the speaker lock, so running swapFn here
+			// (rather than on a detached goroutine) makes the player-side swap
+			// of current ← next atomic from the UI thread's perspective: any
+			// concurrent playPipeline/preloadPipeline/Stop/Seek is blocked on
+			// the speaker lock until this returns. swapFn must not block — the
+			// player defers the pipeline close itself.
 			if swapFn != nil {
-				go swapFn()
+				swapFn()
 			}
 			g.drained.Store(false)
 		} else {

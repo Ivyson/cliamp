@@ -87,27 +87,44 @@ func New(q Quality) (*Player, error) {
 	p.volMin.Store(math.Float64bits(-50))
 	p.speed.Store(math.Float64bits(1.0))
 	p.gapless = &gaplessStreamer{}
+	// gaplessSwap is invoked synchronously by gaplessStreamer.Stream on the
+	// audio thread (under the speaker lock) when a gapless transition occurs.
+	p.gapless.onSwap = p.gaplessSwap
 	// Suspend the speaker immediately; the ALSA audio callback goroutine
 	// burns ~2% CPU even on silence. Resume is called on every Play().
 	_ = speaker.Suspend()
 	p.suspended = true
-	p.gapless.onSwap = func() {
-		// Called from audio thread (goroutine) when gapless transition occurs.
-		// Swap current ← nextPipeline and close the old one. The API metadata
-		// poller is intentionally not restarted here: gapless advance is for
-		// finite tracks, while resolver-backed streams (NTS, FIP) are infinite
-		// live radio that is never preloaded as a gapless next track.
-		p.mu.Lock()
-		old := p.current
-		p.current = p.nextPipeline
-		p.nextPipeline = nil
-		p.mu.Unlock()
-		if old != nil {
-			old.close()
-		}
-		p.gaplessAdvance.Store(true)
-	}
 	return p, nil
+}
+
+// gaplessSwap commits the player-side bookkeeping when a gapless transition
+// fires. It runs synchronously from gaplessStreamer.Stream, on the audio thread
+// under the speaker lock. Running inline rather than on a detached goroutine
+// makes the promotion of current ← nextPipeline atomic with respect to the UI
+// thread: any concurrent playPipeline/preloadPipeline/Stop/Seek is blocked on
+// the speaker lock until the swap commits, so the late bookkeeping can never
+// clobber a track the user just selected or close a pipeline the audio thread
+// is still streaming.
+//
+// Only the potentially-blocking pipeline close is deferred to a goroutine so
+// the audio thread never stalls on an ffmpeg process Wait. That deferred close
+// is safe because after the synchronous swap the retired pipeline is
+// unreachable from p.current/p.nextPipeline — any racing playPipeline would
+// have already replaced the gapless source, cancelling the transition.
+//
+// The API metadata poller is intentionally not restarted here: gapless advance
+// is for finite tracks, while resolver-backed streams (NTS, FIP) are infinite
+// live radio that is never preloaded as a gapless next track.
+func (p *Player) gaplessSwap() {
+	p.mu.Lock()
+	old := p.current
+	p.current = p.nextPipeline
+	p.nextPipeline = nil
+	p.mu.Unlock()
+	p.gaplessAdvance.Store(true)
+	if old != nil {
+		go old.close()
+	}
 }
 
 // Play opens and starts playing an audio file. On the first call it builds
