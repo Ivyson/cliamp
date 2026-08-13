@@ -168,8 +168,6 @@ func (p *SpotifyProvider) Name() string { return "Spotify" }
 // currentUserID returns the authenticated user's Spotify ID, fetched from
 // /v1/me at most once per session. Failures are remembered so a network blip
 // during the first call doesn't trigger a request on every later use.
-// userID is used by playlistAccessible to filter playlists the user doesn't
-// own (which 403 on Tracks() for dev-mode apps).
 func (p *SpotifyProvider) currentUserID(ctx context.Context) string {
 	p.mu.Lock()
 	if p.meFetched {
@@ -193,10 +191,7 @@ func (p *SpotifyProvider) currentUserID(ctx context.Context) string {
 	return p.userID
 }
 
-// Playlists returns the authenticated user's Spotify playlists.
-// Only playlists owned by the user or marked as collaborative are returned;
-// playlists saved from other users are excluded because the Spotify API
-// returns 403 when trying to list their tracks.
+// Playlists returns all playlists in the authenticated user's Spotify library.
 func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
 	if err := p.ensureSession(); err != nil {
 		return nil, err
@@ -213,7 +208,7 @@ func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	userID := p.currentUserID(ctx) // empty string if fetch fails → no filtering
+	userID := p.currentUserID(ctx)
 
 	var all []playlist.PlaylistInfo
 	offset := 0
@@ -248,8 +243,7 @@ func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
 		query := url.Values{
 			"limit":  {fmt.Sprintf("%d", limit)},
 			"offset": {fmt.Sprintf("%d", offset)},
-			// Include owner.id and collaborative to filter inaccessible playlists.
-			"fields": {"items(id,name,snapshot_id,collaborative,owner(id),items.total),total"},
+			"fields": {"items(id,name,snapshot_id,owner(id),items.total),total"},
 		}
 
 		resp, err := p.webAPI(ctx, "GET", "/v1/me/playlists", query)
@@ -267,9 +261,6 @@ func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
 
 		p.mu.Lock()
 		for _, item := range result.Items {
-			if !playlistAccessible(item, userID) {
-				continue
-			}
 			count := 0
 			if item.Items != nil {
 				count = item.Items.Total
@@ -368,9 +359,6 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 		}
 
 		if err != nil {
-			if strings.Contains(err.Error(), "403") {
-				return nil, fmt.Errorf("spotify: playlist not accessible: only playlists you own or collaborate on can be loaded")
-			}
 			return nil, fmt.Errorf("spotify: list tracks: %w", err)
 		}
 

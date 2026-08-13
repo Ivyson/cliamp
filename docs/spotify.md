@@ -4,7 +4,7 @@ Cliamp can stream your [Spotify](https://www.spotify.com/) library directly thro
 
 > **Windows:** Spotify is currently unavailable on Windows builds because the `go-librespot` playback backend used by cliamp does not compile there yet.
 >
-> **Quick start:** run `cliamp setup`, pick Spotify, and follow the prompts. The recommended path is to register your own Spotify Developer app and paste its `client_id` — it gives you a private rate-limit quota and works for playback, library, and playlists. There's also a built-in shared `client_id` available for users who specifically need Spotify search.
+> **Quick start:** run `cliamp setup`, pick Spotify, and follow the prompts. The recommended path is to register your own Spotify Developer app and paste its `client_id` for a private Web API rate-limit quota. Cliamp authorizes playback separately with Spotify's built-in identity. A built-in shared `client_id` is also available for users who specifically need Spotify search.
 
 ## Setup
 
@@ -30,11 +30,11 @@ To register one:
 
 `bitrate` is optional. If omitted, cliamp uses `320`. Supported values are `96`, `160`, and `320`. Non-positive values (≤ 0) are treated as `320`. Other positive values are rounded to the nearest supported bitrate.
 
-Run `cliamp`, select Spotify as a provider, and press Enter to sign in. Credentials are cached at `~/.config/cliamp/spotify_credentials.json`. Subsequent launches refresh silently.
+Run `cliamp`, select Spotify as a provider, and press Enter to sign in. When using your own `client_id`, the browser completes two authorization steps in the same tab: one for Web API access and one for playback. The built-in client path needs one step. Credentials are cached at `~/.config/cliamp/spotify_credentials.json`; subsequent launches refresh silently.
 
 ### Newer apps and the search caveat
 
-Apps registered in Development Mode (the default for anything created on developer.spotify.com after Nov 27, 2024) **still work for almost everything** — playback, your library, your playlists, save/follow actions, OAuth itself. The one specific thing they can't do is hit Spotify's **catalog endpoints**: `/v1/search` and a handful of related endpoints.
+Apps registered in Development Mode (the default for anything created on developer.spotify.com after Nov 27, 2024) still work for your library, your playlists, save/follow actions, and OAuth itself. Playback uses its separate authorization. The one specific thing newer apps cannot do is hit Spotify's **catalog endpoints**: `/v1/search` and a handful of related endpoints.
 
 You'll see the catalog restriction as `400 "Invalid limit"` whenever you press <kbd>Ctrl+F</kbd> to search Spotify — Spotify [introduced this restriction on Nov 27, 2024](https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api) and rarely grants Extended Quota Mode to personal/non-commercial apps. Cliamp surfaces a friendlier error explaining what's actually wrong instead of the raw "Invalid limit" message.
 
@@ -83,6 +83,7 @@ Podcast episodes work like tracks. Press `Ctrl+F` to search Spotify and matching
 ## Troubleshooting
 
 - **"OAuth failed"**: Make sure your redirect URI is exactly `http://127.0.0.1:19872/login` in the Spotify dashboard (no trailing slash).
+- **Two authorization steps**: This is expected when using your own `client_id`. After Web API access is approved, the same browser tab redirects to create a playback credential using Spotify's required built-in identity.
 - **Playlist not showing**: You must save/follow the playlist in Spotify for it to appear. Only your library playlists are listed.
 - **Playback issues**: Spotify integration requires a Premium account. Free accounts cannot stream.
 - **Re-authenticate**: Run `cliamp spotify reset` to clear stored credentials, then relaunch cliamp and select Spotify to sign in again. (Equivalent to deleting `~/.config/cliamp/spotify_credentials.json` manually.)

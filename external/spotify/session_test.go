@@ -5,12 +5,20 @@ package spotify
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
+	"time"
 
 	"golang.org/x/oauth2"
 )
+
+type tokenSourceFunc func() (*oauth2.Token, error)
+
+func (f tokenSourceFunc) Token() (*oauth2.Token, error) { return f() }
 
 func TestIsInvalidGrant(t *testing.T) {
 	tests := []struct {
@@ -33,6 +41,188 @@ func TestIsInvalidGrant(t *testing.T) {
 				t.Errorf("isInvalidGrant(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestInteractiveOAuthFlows(t *testing.T) {
+	tests := []struct {
+		name     string
+		clientID string
+		want     []oauthFlow
+	}{
+		{
+			name:     "built-in client uses one flow",
+			clientID: DefaultClientID,
+			want:     []oauthFlow{{name: "web api and playback", clientID: DefaultClientID, scopes: oauthScopes}},
+		},
+		{
+			name:     "custom client authorizes playback through keymaster",
+			clientID: "custom-client",
+			want: []oauthFlow{
+				{name: "web api", clientID: "custom-client", scopes: oauthScopes},
+				{name: "playback", clientID: DefaultClientID, scopes: playbackOAuthScopes},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := interactiveOAuthFlows(tt.clientID)
+			if len(got) != len(tt.want) {
+				t.Fatalf("OAuth flows = %d, want %d", len(got), len(tt.want))
+			}
+			for i := range got {
+				if got[i].name != tt.want[i].name || got[i].clientID != tt.want[i].clientID || !slices.Equal(got[i].scopes, tt.want[i].scopes) {
+					t.Errorf("OAuth flow %d = (%q, %q, %v), want (%q, %q, %v)", i, got[i].name, got[i].clientID, got[i].scopes, tt.want[i].name, tt.want[i].clientID, tt.want[i].scopes)
+				}
+			}
+		})
+	}
+}
+
+func TestOAuthCallbackHandlerChainsFlows(t *testing.T) {
+	pending := []pendingOAuthFlow{
+		{state: "web-state"},
+		{state: "playback-state", authURL: "https://accounts.spotify.com/playback"},
+	}
+	callbacks := make(chan oauthCallback, len(pending))
+	handler := oauthCallbackHandler(pending, callbacks)
+
+	webResponse := httptest.NewRecorder()
+	handler.ServeHTTP(webResponse, httptest.NewRequest(http.MethodGet, "/login?state=web-state&code=web-code", nil))
+	if webResponse.Code != http.StatusFound {
+		t.Fatalf("web callback status = %d, want %d", webResponse.Code, http.StatusFound)
+	}
+	if location := webResponse.Header().Get("Location"); location != pending[1].authURL {
+		t.Errorf("web callback location = %q, want %q", location, pending[1].authURL)
+	}
+	if callback := <-callbacks; callback.flow != 0 || callback.code != "web-code" || callback.err != nil {
+		t.Errorf("web callback = %+v, want flow 0 with web-code", callback)
+	}
+
+	// Browser retries must not submit the same authorization code twice.
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/login?state=web-state&code=web-code", nil))
+	if len(callbacks) != 0 {
+		t.Fatalf("duplicate callback queued %d extra result(s)", len(callbacks))
+	}
+
+	playbackResponse := httptest.NewRecorder()
+	handler.ServeHTTP(playbackResponse, httptest.NewRequest(http.MethodGet, "/login?state=playback-state&code=playback-code", nil))
+	if playbackResponse.Code != http.StatusOK {
+		t.Fatalf("playback callback status = %d, want %d", playbackResponse.Code, http.StatusOK)
+	}
+	if callback := <-callbacks; callback.flow != 1 || callback.code != "playback-code" || callback.err != nil {
+		t.Errorf("playback callback = %+v, want flow 1 with playback-code", callback)
+	}
+}
+
+func TestOAuthCallbackHandlerRejectsUnknownState(t *testing.T) {
+	callbacks := make(chan oauthCallback, 1)
+	handler := oauthCallbackHandler([]pendingOAuthFlow{{state: "known"}}, callbacks)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/login?state=unknown&code=code", nil))
+
+	if response.Code != http.StatusBadRequest {
+		t.Errorf("unknown state status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+	if len(callbacks) != 0 {
+		t.Errorf("unknown state queued %d callback(s), want 0", len(callbacks))
+	}
+}
+
+func TestPersistingTokenSourcePersistsRotationOnce(t *testing.T) {
+	var persisted []string
+	source := &persistingTokenSource{
+		source:       tokenSourceFunc(func() (*oauth2.Token, error) { return &oauth2.Token{AccessToken: "access", RefreshToken: "new"}, nil }),
+		refreshToken: "old",
+		persist: func(refreshToken string) error {
+			persisted = append(persisted, refreshToken)
+			return nil
+		},
+	}
+
+	for range 2 {
+		token, err := source.Token()
+		if err != nil {
+			t.Fatalf("Token() error = %v", err)
+		}
+		if token.AccessToken != "access" {
+			t.Errorf("access token = %q, want access", token.AccessToken)
+		}
+	}
+	if !slices.Equal(persisted, []string{"new"}) {
+		t.Errorf("persisted refresh tokens = %v, want [new]", persisted)
+	}
+}
+
+func TestPersistingTokenSourceDoesNotBlockOnSaveFailure(t *testing.T) {
+	wantErr := errors.New("disk full")
+	attempts := 0
+	source := &persistingTokenSource{
+		source:       tokenSourceFunc(func() (*oauth2.Token, error) { return &oauth2.Token{AccessToken: "access", RefreshToken: "new"}, nil }),
+		refreshToken: "old",
+		persist: func(string) error {
+			attempts++
+			return wantErr
+		},
+	}
+
+	for range 2 {
+		token, err := source.Token()
+		if err != nil {
+			t.Fatalf("Token() error = %v, want successful access despite persistence failure", err)
+		}
+		if token.AccessToken != "access" {
+			t.Errorf("access token = %q, want access", token.AccessToken)
+		}
+	}
+	if attempts != 1 {
+		t.Errorf("persistence attempts = %d, want 1 for one rotated token", attempts)
+	}
+}
+
+func TestWebAPITokenSourcePersistsRotatedRefreshToken(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	stored := storedCreds{
+		Username:     "user",
+		Data:         []byte("playback-credential"),
+		DeviceID:     "device",
+		RefreshToken: "old",
+	}
+	if err := saveCreds(&stored); err != nil {
+		t.Fatal(err)
+	}
+
+	source := webAPITokenSource("client", &oauth2.Token{
+		AccessToken:  "access",
+		RefreshToken: "new",
+		Expiry:       time.Now().Add(time.Hour),
+	}, stored)
+	if _, err := source.Token(); err != nil {
+		t.Fatalf("Token() error = %v", err)
+	}
+
+	got, err := loadCreds()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Username != stored.Username || got.DeviceID != stored.DeviceID || !slices.Equal(got.Data, stored.Data) {
+		t.Errorf("non-OAuth credentials changed: got %+v, want username/device/data from %+v", got, stored)
+	}
+	if got.RefreshToken != "new" {
+		t.Errorf("refresh token = %q, want new", got.RefreshToken)
+	}
+	path, err := CredsPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Errorf("credentials mode = %o, want 600", mode)
 	}
 }
 

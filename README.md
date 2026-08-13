@@ -2,7 +2,7 @@
 
 A retro terminal music player inspired by Winamp. Play local files, streams, podcasts, YouTube, YouTube Music, SoundCloud, Bilibili, Spotify, NetEase Cloud Music, Xiaoyuzhou (小宇宙), Navidrome, Plex, and Jellyfin with a spectrum visualizer, parametric EQ, and playlist management.
 
-**[cliamp.stream](https://cliamp.stream)** · **[docs.cliamp.stream](https://docs.cliamp.stream)**
+**[cliamp.stream](https://cliamp.stream)** · **[docs](https://whiterose.org.contextowl.co/docs/cliamp)**
 
 Built with [Bubbletea](https://github.com/charmbracelet/bubbletea), [Lip Gloss](https://github.com/charmbracelet/lipgloss), [Beep](https://github.com/gopxl/beep), and [go-librespot](https://github.com/devgianlu/go-librespot).
 
@@ -153,7 +153,7 @@ Or without Make: `go build -o cliamp .`
 
 ## Docs
 
-Full documentation is hosted at **[docs.cliamp.stream](https://docs.cliamp.stream)**.
+Full documentation is hosted at **[whiterose.org.contextowl.co/docs/cliamp](https://whiterose.org.contextowl.co/docs/cliamp)**.
 
 ## Troubleshooting
 

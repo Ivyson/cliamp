@@ -14,12 +14,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 
 	"github.com/bjarneo/cliamp/applog"
 	"github.com/bjarneo/cliamp/internal/browser"
+	"github.com/bjarneo/cliamp/internal/fileutil"
 	"github.com/bjarneo/cliamp/playlist"
 
 	librespot "github.com/devgianlu/go-librespot"
@@ -172,20 +172,22 @@ func newSessionFromStored(ctx context.Context, clientID string, creds *storedCre
 		oauthToken = token
 	}
 
-	// Create an auto-refreshing token source — handles expiry transparently.
-	conf := spotifyOAuthConfig(clientID)
-	ts := conf.TokenSource(context.Background(), oauthToken)
-
-	s := &Session{sess: sess, devID: devID, clientID: clientID, tokenSource: ts}
-
 	// Re-save credentials (including refresh token for next launch).
-	if err := saveCreds(&storedCreds{
+	stored := storedCreds{
 		Username:     sess.Username(),
 		Data:         sess.StoredCredentials(),
 		DeviceID:     devID,
 		RefreshToken: oauthToken.RefreshToken,
-	}); err != nil {
+	}
+	if err := saveCreds(&stored); err != nil {
 		applog.UserError("spotify: failed to save credentials: %v", err)
+	}
+
+	s := &Session{
+		sess:        sess,
+		devID:       devID,
+		clientID:    clientID,
+		tokenSource: webAPITokenSource(clientID, oauthToken, stored),
 	}
 
 	if err := s.initPlayer(); err != nil {
@@ -223,12 +225,16 @@ var oauthScopes = []string{
 	"user-follow-modify",
 }
 
+// playbackOAuthScopes are requested through Spotify's keymaster client. Since
+// August 2026, login5 rejects playback credentials minted by any other client.
+var playbackOAuthScopes = []string{"streaming"}
+
 // spotifyOAuthConfig returns the OAuth2 config for the given client ID.
-func spotifyOAuthConfig(clientID string) *oauth2.Config {
+func spotifyOAuthConfig(clientID string, scopes []string) *oauth2.Config {
 	return &oauth2.Config{
 		ClientID:    clientID,
 		RedirectURL: fmt.Sprintf("http://127.0.0.1:%d/login", CallbackPort),
-		Scopes:      oauthScopes,
+		Scopes:      scopes,
 		Endpoint:    spotifyoauth2.Endpoint,
 	}
 }
@@ -236,9 +242,52 @@ func spotifyOAuthConfig(clientID string) *oauth2.Config {
 // silentTokenRefresh uses a stored refresh token to get a new access token
 // without opening a browser.
 func silentTokenRefresh(clientID, refreshToken string) (*oauth2.Token, error) {
-	conf := spotifyOAuthConfig(clientID)
+	conf := spotifyOAuthConfig(clientID, oauthScopes)
 	src := conf.TokenSource(context.Background(), &oauth2.Token{RefreshToken: refreshToken})
 	return src.Token()
+}
+
+// persistingTokenSource saves refresh-token rotations without making a usable
+// access token fail when credential persistence itself fails.
+type persistingTokenSource struct {
+	source       oauth2.TokenSource
+	persist      func(string) error
+	mu           sync.Mutex
+	refreshToken string
+}
+
+func (s *persistingTokenSource) Token() (*oauth2.Token, error) {
+	token, err := s.source.Token()
+	if err != nil {
+		return nil, err
+	}
+	if token.RefreshToken == "" {
+		return token, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if token.RefreshToken == s.refreshToken {
+		return token, nil
+	}
+	s.refreshToken = token.RefreshToken
+	if err := s.persist(token.RefreshToken); err != nil {
+		applog.UserError("spotify: failed to persist rotated refresh token: %v", err)
+	}
+	return token, nil
+}
+
+func webAPITokenSource(clientID string, token *oauth2.Token, creds storedCreds) oauth2.TokenSource {
+	conf := spotifyOAuthConfig(clientID, oauthScopes)
+	source := conf.TokenSource(context.Background(), token)
+	return &persistingTokenSource{
+		source:       source,
+		refreshToken: creds.RefreshToken,
+		persist: func(refreshToken string) error {
+			creds.RefreshToken = refreshToken
+			return saveCreds(&creds)
+		},
+	}
 }
 
 // isInvalidGrant reports whether err is an OAuth2 invalid_grant response
@@ -262,57 +311,146 @@ const oauthCallbackHTML = `<!DOCTYPE html>
 <script>setTimeout(function(){window.close()},1500)</script>
 </div></body></html>`
 
-// performOAuth2PKCE runs an OAuth2 PKCE flow: opens a browser for user consent,
-// waits for the callback, and exchanges the code for a token.
-func performOAuth2PKCE(ctx context.Context, clientID string) (*oauth2.Token, error) {
+type oauthFlow struct {
+	name     string
+	clientID string
+	scopes   []string
+}
+
+type pendingOAuthFlow struct {
+	oauthFlow
+	config   *oauth2.Config
+	verifier string
+	state    string
+	authURL  string
+}
+
+type oauthCallback struct {
+	flow int
+	code string
+	err  error
+}
+
+func oauthCallbackHandler(pending []pendingOAuthFlow, callbackCh chan<- oauthCallback) http.Handler {
+	byState := make(map[string]int, len(pending))
+	for i, flow := range pending {
+		byState[flow.state] = i
+	}
+
+	seen := make(map[string]bool, len(pending))
+	var mu sync.Mutex
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		state := r.URL.Query().Get("state")
+		flow, ok := byState[state]
+		if !ok {
+			http.Error(w, "invalid OAuth state", http.StatusBadRequest)
+			return
+		}
+
+		code := r.URL.Query().Get("code")
+		oauthErr := r.URL.Query().Get("error")
+		if code == "" && oauthErr == "" {
+			http.Error(w, "OAuth callback contains no code", http.StatusBadRequest)
+			return
+		}
+
+		mu.Lock()
+		first := !seen[state]
+		seen[state] = true
+		mu.Unlock()
+		if first {
+			result := oauthCallback{flow: flow, code: code}
+			if oauthErr != "" {
+				result.err = fmt.Errorf("spotify returned %s", oauthErr)
+			}
+			callbackCh <- result
+		}
+
+		if oauthErr != "" {
+			http.Error(w, "Spotify authorization failed", http.StatusBadRequest)
+			return
+		}
+		if flow+1 < len(pending) {
+			http.Redirect(w, r, pending[flow+1].authURL, http.StatusFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(oauthCallbackHTML))
+	})
+}
+
+// performOAuth2PKCE runs one OAuth2 PKCE flow and returns its token.
+func performOAuth2PKCE(ctx context.Context, clientID string, scopes []string) (*oauth2.Token, error) {
+	tokens, err := performOAuth2PKCEFlows(ctx, []oauthFlow{{name: "web api", clientID: clientID, scopes: scopes}})
+	if err != nil {
+		return nil, err
+	}
+	return tokens[0], nil
+}
+
+// performOAuth2PKCEFlows opens one browser journey for one or more OAuth
+// authorizations. Each callback redirects the same tab to the next flow, so a
+// custom Web API client can be followed by keymaster playback authorization
+// without relying on the browser to foreground a second tab.
+func performOAuth2PKCEFlows(ctx context.Context, flows []oauthFlow) ([]*oauth2.Token, error) {
+	if len(flows) == 0 {
+		return nil, fmt.Errorf("no OAuth flows configured")
+	}
+
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", CallbackPort))
 	if err != nil {
 		return nil, fmt.Errorf("listen on port %d: %w", CallbackPort, err)
 	}
 	defer lis.Close() // always release the port
 
-	oauthConf := spotifyOAuthConfig(clientID)
+	pending := make([]pendingOAuthFlow, len(flows))
+	for i, flow := range flows {
+		conf := spotifyOAuthConfig(flow.clientID, flow.scopes)
+		verifier := oauth2.GenerateVerifier()
+		state := oauth2.GenerateVerifier()
+		pending[i] = pendingOAuthFlow{
+			oauthFlow: flow,
+			config:    conf,
+			verifier:  verifier,
+			state:     state,
+			authURL:   conf.AuthCodeURL(state, oauth2.S256ChallengeOption(verifier)),
+		}
+	}
 
-	verifier := oauth2.GenerateVerifier()
-	authURL := oauthConf.AuthCodeURL("", oauth2.S256ChallengeOption(verifier))
-
-	notifyAuthURL(authURL)
-
-	codeCh := make(chan string, 1)
+	callbackCh := make(chan oauthCallback, len(flows))
 	go func() {
-		if err := http.Serve(lis, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			code := r.URL.Query().Get("code")
-			if code != "" {
-				codeCh <- code
-			}
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = w.Write([]byte(oauthCallbackHTML))
-		})); err != nil && !errors.Is(err, net.ErrClosed) {
+		if err := http.Serve(lis, oauthCallbackHandler(pending, callbackCh)); err != nil && !errors.Is(err, net.ErrClosed) {
 			applog.UserError("spotify: auth callback server error: %v", err)
 		}
 	}()
 
-	_ = browser.Open(authURL) // best-effort — user can open the URL manually if this fails
+	notifyAuthURL(pending[0].authURL)
+	_ = browser.Open(pending[0].authURL) // best-effort — user can open the URL manually if this fails
 
-	var code string
-	select {
-	case code = <-codeCh:
-	case <-ctx.Done():
-		return nil, fmt.Errorf("authentication cancelled: %w", ctx.Err())
+	tokens := make([]*oauth2.Token, len(pending))
+	for remaining := len(pending); remaining > 0; remaining-- {
+		select {
+		case result := <-callbackCh:
+			flow := pending[result.flow]
+			if result.err != nil {
+				return nil, fmt.Errorf("%s authorization: %w", flow.name, result.err)
+			}
+			token, err := flow.config.Exchange(ctx, result.code, oauth2.VerifierOption(flow.verifier))
+			if err != nil {
+				return nil, fmt.Errorf("%s token exchange: %w", flow.name, err)
+			}
+			tokens[result.flow] = token
+		case <-ctx.Done():
+			return nil, fmt.Errorf("authentication cancelled: %w", ctx.Err())
+		}
 	}
-
-	token, err := oauthConf.Exchange(ctx, code, oauth2.VerifierOption(verifier))
-	if err != nil {
-		return nil, fmt.Errorf("token exchange: %w", err)
-	}
-
-	return token, nil
+	return tokens, nil
 }
 
 // doWebAPIAuth performs an OAuth2 PKCE flow to get a fresh Web API access token.
 // Opens a browser for user consent, returns the full token (including refresh token).
 func doWebAPIAuth(ctx context.Context, clientID string) (*oauth2.Token, error) {
-	token, err := performOAuth2PKCE(ctx, clientID)
+	token, err := performOAuth2PKCE(ctx, clientID, oauthScopes)
 	if err != nil {
 		return nil, err
 	}
@@ -320,18 +458,32 @@ func doWebAPIAuth(ctx context.Context, clientID string) (*oauth2.Token, error) {
 	return token, nil
 }
 
+// interactiveOAuthFlows returns the authorization sequence for a new session.
+// The built-in client already is keymaster, so it needs only one flow.
+func interactiveOAuthFlows(clientID string) []oauthFlow {
+	if clientID == DefaultClientID {
+		return []oauthFlow{{name: "web api and playback", clientID: clientID, scopes: oauthScopes}}
+	}
+	return []oauthFlow{
+		{name: "web api", clientID: clientID, scopes: oauthScopes},
+		{name: "playback", clientID: DefaultClientID, scopes: playbackOAuthScopes},
+	}
+}
+
 func newInteractiveSession(ctx context.Context, clientID string) (*Session, error) {
 	devID := generateDeviceID()
 
-	token, err := performOAuth2PKCE(ctx, clientID)
+	tokens, err := performOAuth2PKCEFlows(ctx, interactiveOAuthFlows(clientID))
 	if err != nil {
 		return nil, fmt.Errorf("spotify: %w", err)
 	}
+	webToken := tokens[0]
+	playbackToken := tokens[len(tokens)-1]
 
-	username, _ := token.Extra("username").(string)
-	accessToken := token.AccessToken
+	username, _ := playbackToken.Extra("username").(string)
+	accessToken := playbackToken.AccessToken
 
-	// Create go-librespot session using the OAuth2 token.
+	// Create go-librespot session using the keymaster-issued playback token.
 	sess, err := session.NewSessionFromOptions(ctx, &session.Options{
 		Log:        &librespot.NullLogger{},
 		DeviceType: devicespb.DeviceType_COMPUTER,
@@ -346,20 +498,22 @@ func newInteractiveSession(ctx context.Context, clientID string) (*Session, erro
 	}
 
 	// Persist stored credentials + refresh token for future sessions.
-	if err := saveCreds(&storedCreds{
+	stored := storedCreds{
 		Username:     sess.Username(),
 		Data:         sess.StoredCredentials(),
 		DeviceID:     devID,
-		RefreshToken: token.RefreshToken,
-	}); err != nil {
+		RefreshToken: webToken.RefreshToken,
+	}
+	if err := saveCreds(&stored); err != nil {
 		applog.UserError("spotify: failed to save credentials: %v", err)
 	}
 
-	// Create an auto-refreshing token source for Web API calls.
-	conf := spotifyOAuthConfig(clientID)
-	ts := conf.TokenSource(context.Background(), token)
-
-	s := &Session{sess: sess, devID: devID, clientID: clientID, tokenSource: ts}
+	s := &Session{
+		sess:        sess,
+		devID:       devID,
+		clientID:    clientID,
+		tokenSource: webAPITokenSource(clientID, webToken, stored),
+	}
 	if err := s.initPlayer(); err != nil {
 		sess.Close()
 		return nil, err
@@ -548,12 +702,9 @@ func saveCreds(creds *storedCreds) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
 	data, err := json.Marshal(creds)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	return fileutil.WriteFileAtomic(path, data, 0o600)
 }
