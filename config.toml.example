@@ -29,7 +29,7 @@ seek_large_step_sec = 30
 
 # Advanced audio settings (most users don't need to change these)
 # sample_rate = 0          # 0=auto-detect, or 22050/44100/48000/96000/192000
-# buffer_ms = 100          # speaker buffer in ms (50-500)
+# buffer_ms = 250          # speaker buffer in ms (50-5000; try 2000 for unstable radio streams)
 # resample_quality = 4     # 1-4, where 4 is best
 # bit_depth = 16           # 16 or 32 (for FFmpeg-decoded formats)
 

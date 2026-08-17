@@ -18,7 +18,7 @@ cliamp --playlist "Blade Runner"      # load a local TOML playlist (add --auto-p
 
 ```sh
 cliamp --sample-rate 48000 track.mp3      # output sample rate (22050, 44100, 48000, 96000, 192000)
-cliamp --buffer-ms 200 track.mp3          # speaker buffer in ms (50–500)
+cliamp --buffer-ms 2000 track.mp3         # speaker buffer in ms (50-5000; useful for unstable radio)
 cliamp --resample-quality 1 track.mp3     # resample quality factor (1–4)
 cliamp --bit-depth 32 track.m4a           # PCM bit depth: 16 (default) or 32 (lossless)
 ```
@@ -116,7 +116,7 @@ cliamp track.mp3 --repeat all --mono ~/Music
 | `--theme` | string | | theme name |
 | `--eq-preset` | string | | preset name |
 | `--sample-rate` | int | 44100 | 22050, 44100, 48000, 96000, 192000 |
-| `--buffer-ms` | int | 100 | 50–500 |
+| `--buffer-ms` | int | 250 | 50-5000 |
 | `--resample-quality` | int | 4 | 1–4 |
 | `--bit-depth` | int | 16 | 16, 32 |
 | `--playlist` | string | | local TOML playlist name |

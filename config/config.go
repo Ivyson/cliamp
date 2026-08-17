@@ -251,7 +251,7 @@ type Config struct {
 	Theme            string                       // theme name, or "" for ANSI default
 	Visualizer       string                       // visualizer mode name, or "" for default (Bars)
 	SampleRate       int                          // output sample rate: 22050, 44100, 48000, 96000, 192000
-	BufferMs         int                          // speaker buffer in milliseconds (50–500)
+	BufferMs         int                          // speaker buffer in milliseconds (50-5000)
 	ResampleQuality  int                          // beep resample quality factor (1–4)
 	BitDepth         int                          // PCM bit depth for FFmpeg output: 16 or 32
 	Compact          bool                         // compact mode: cap frame width at 80 columns
@@ -287,7 +287,7 @@ func defaultConfig() Config {
 		Speed:           1.0,
 		SeekStepLarge:   30,
 		SampleRate:      0,
-		BufferMs:        100,
+		BufferMs:        250,
 		ResampleQuality: 4,
 		BitDepth:        16,
 		PaddingH:        3,
@@ -763,7 +763,7 @@ func (c *Config) clamp() {
 	}
 	c.SeekStepLarge = max(min(c.SeekStepLarge, 600), 6)
 	c.SampleRate = clampSampleRate(c.SampleRate)
-	c.BufferMs = max(min(c.BufferMs, 500), 50)
+	c.BufferMs = max(min(c.BufferMs, 5000), 50)
 	c.ResampleQuality = max(min(c.ResampleQuality, 4), 1)
 	c.BitDepth = clampBitDepth(c.BitDepth)
 	c.Spotify.Bitrate = clampSpotifyBitrate(c.Spotify.Bitrate)

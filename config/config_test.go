@@ -22,8 +22,8 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.SampleRate != 0 {
 		t.Errorf("SampleRate = %d, want 0 (auto)", cfg.SampleRate)
 	}
-	if cfg.BufferMs != 100 {
-		t.Errorf("BufferMs = %d, want 100", cfg.BufferMs)
+	if cfg.BufferMs != 250 {
+		t.Errorf("BufferMs = %d, want 250", cfg.BufferMs)
 	}
 	if cfg.ResampleQuality != 4 {
 		t.Errorf("ResampleQuality = %d, want 4", cfg.ResampleQuality)
@@ -223,9 +223,10 @@ func TestClampBufferMs(t *testing.T) {
 	}{
 		{100, 100},
 		{10, 50},
-		{600, 500},
+		{600, 600},
 		{50, 50},
-		{500, 500},
+		{5000, 5000},
+		{5001, 5000},
 	}
 	for _, tt := range tests {
 		cfg := defaultConfig()

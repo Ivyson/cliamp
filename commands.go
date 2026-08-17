@@ -38,7 +38,7 @@ func buildApp() *cli.Command {
 		&cli.StringFlag{Name: "visualizer", Usage: "visualizer mode"},
 		&cli.StringFlag{Name: "eq-preset", Usage: "EQ preset name"},
 		&cli.IntFlag{Name: "sample-rate", Usage: "output sample rate in Hz (0=auto)", HideDefault: true},
-		&cli.IntFlag{Name: "buffer-ms", Usage: "speaker buffer in milliseconds (50-500)", HideDefault: true},
+		&cli.IntFlag{Name: "buffer-ms", Usage: "speaker buffer in milliseconds (50-5000)", HideDefault: true},
 		&cli.IntFlag{Name: "resample-quality", Usage: "resample quality factor (1-4)", HideDefault: true},
 		&cli.IntFlag{Name: "bit-depth", Usage: "PCM bit depth: 16 or 32", HideDefault: true},
 		&cli.StringFlag{Name: "audio-device", Usage: "audio output device (use 'list' to show)"},
