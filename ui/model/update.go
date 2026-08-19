@@ -18,6 +18,16 @@ import (
 	"github.com/bjarneo/cliamp/ui"
 )
 
+func (m *Model) scheduleReconnect(now time.Time) {
+	if !m.reconnect.at.IsZero() || m.reconnect.attempts >= 5 {
+		return
+	}
+	delay := time.Second << m.reconnect.attempts
+	m.reconnect.at = now.Add(delay)
+	m.reconnect.attempts++
+	m.err = fmt.Errorf("reconnecting in %s", delay)
+}
+
 // Update handles messages: key presses, ticks, and window resizes.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	wasScreen := m.activeScreen()
@@ -119,6 +129,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cachedPos = 0
 		}
 		m.tickVisualizer(now)
+		m.tickProgressReport(now)
 		// Process debounced yt-dlp seek.
 		var seekCmd tea.Cmd
 		if cmd := m.tickSeek(dt); cmd != nil {
@@ -151,13 +162,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			track, idx := m.currentPlaybackTrack()
 			isStream := idx >= 0 && (track.Stream || playlist.IsYouTubeURL(track.Path) || playlist.IsYTDL(track.Path))
 			if isStream && m.reconnect.attempts < 5 {
-				// Schedule reconnect with exponential backoff: 1s, 2s, 4s, 8s, 16s
-				if m.reconnect.at.IsZero() {
-					delay := time.Second << m.reconnect.attempts
-					m.reconnect.at = now.Add(delay)
-					m.reconnect.attempts++
-					m.err = fmt.Errorf("reconnecting in %s", delay)
-				}
+				m.scheduleReconnect(now)
 			} else {
 				m.err = err
 				m.reconnect.at = time.Time{}
@@ -281,16 +286,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Skip if already buffering a yt-dlp download to avoid advancing
 		// the playlist on every tick while waiting for the resolve.
 		if m.player.IsPlaying() && !m.player.IsPaused() && m.player.Drained() && !m.buffering && m.reconnect.at.IsZero() {
-			// Track drained to end — always ≥ 50%.
-			finishedTrack, _ := m.currentPlaybackTrack()
-			drainDur := time.Duration(finishedTrack.DurationSecs) * time.Second
-			m.maybeScrobble(finishedTrack, drainDur, drainDur)
+			finishedTrack, idx := m.currentPlaybackTrack()
+			if idx >= 0 && finishedTrack.IsLive() {
+				// A live stream has no natural end. A clean decoder EOF is a
+				// disconnect, so retry this station instead of advancing.
+				m.scheduleReconnect(now)
+			} else {
+				// Track drained to end — always ≥ 50%.
+				drainDur := time.Duration(finishedTrack.DurationSecs) * time.Second
+				m.maybeScrobble(finishedTrack, drainDur, drainDur)
 
-			// Stop the player before dispatching the async nextTrack command.
-			// This clears the gapless streamer so the finished track cannot
-			// replay while waiting for a yt-dlp pipe chain to spin up.
-			m.player.Stop()
-			cmds = append(cmds, m.nextTrack())
+				// Stop the player before dispatching the async nextTrack command.
+				// This clears the gapless streamer so the finished track cannot
+				// replay while waiting for a yt-dlp pipe chain to spin up.
+				m.player.Stop()
+				cmds = append(cmds, m.nextTrack())
+			}
 			m.notifyAll()
 		}
 		if m.player.IsPlaying() && !m.player.IsPaused() {
@@ -369,6 +380,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.plCursor = 0
 		m.plScroll = 0
+		m.applyTracksResume(msg)
 		m.focus = focusPlaylist
 		m.applyHeightMode()
 		m.adjustScroll()
@@ -381,7 +393,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.navBrowser.loading = false
 		if msg.err != nil {
-			m.status.Showf(statusTTLDefault, "Artist load failed: %s", msg.err)
+			m.status.Errorf(statusTTLDefault, "Artist load failed: %s", msg.err)
 			return m, nil
 		}
 		m.navBrowser.artists = msg.artists
@@ -396,7 +408,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.navBrowser.albumLoading = false
 		m.navBrowser.loading = false
 		if msg.err != nil {
-			m.status.Showf(statusTTLDefault, "Album load failed: %s", msg.err)
+			m.status.Errorf(statusTTLDefault, "Album load failed: %s", msg.err)
 			return m, nil
 		}
 		if msg.offset == 0 {
@@ -424,7 +436,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.navBrowser.loading = false
 		if msg.err != nil {
-			m.status.Showf(statusTTLDefault, "Track load failed: %s", msg.err)
+			m.status.Errorf(statusTTLDefault, "Track load failed: %s", msg.err)
 			return m, nil
 		}
 		m.navBrowser.tracks = msg.tracks
@@ -441,7 +453,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.catalogBatch.loading = false
 		if msg.err != nil {
 			m.catalogBatch.done = true
-			m.status.Show("Catalog load failed", statusTTLDefault)
+			m.status.Error("Catalog load failed", statusTTLDefault)
 			return m, nil
 		}
 		if msg.added == 0 {
@@ -463,7 +475,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.provLoading = false
 		if msg.err != nil {
-			m.status.Show("Search failed", statusTTLDefault)
+			m.status.Error("Search failed", statusTTLDefault)
 		} else {
 			if lists, err := m.provider.Playlists(); err == nil {
 				m.providerLists = lists
@@ -471,7 +483,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.provCursor = 0
 			m.provScroll = 0
 			if msg.count == 0 {
-				m.status.Show("No stations found", statusTTLDefault)
+				m.status.Warning("No stations found", statusTTLDefault)
 			}
 		}
 		return m, nil
@@ -484,7 +496,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ytdlBatch.loading = false
 		if msg.err != nil {
 			m.ytdlBatch.done = true
-			m.status.Showf(statusTTLBatch, "Radio batch load failed: %v", msg.err)
+			m.status.Errorf(statusTTLBatch, "Radio batch load failed: %v", msg.err)
 			return m, nil
 		}
 		if len(msg.tracks) == 0 {
@@ -506,7 +518,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case feedTrackResolvedMsg:
 		m.feedLoading = false
 		if len(msg.tracks) == 0 {
-			m.status.Show("No episodes found in feed.", statusTTLDefault)
+			m.status.Warning("No episodes found in feed.", statusTTLDefault)
 			return m, nil
 		}
 		m.playlist.Replace(msg.tracks)
@@ -529,7 +541,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.addToHeaderState(msg.tracks)
 			m.status.Showf(statusTTLDefault, "Loaded %d track(s)", len(msg.tracks))
 		} else {
-			m.status.Show("No tracks found at URL.", statusTTLDefault)
+			m.status.Warning("No tracks found at URL.", statusTTLDefault)
 		}
 		if len(msg.tracks) > 0 {
 			// Set up incremental loading for YouTube Radio playlists.
@@ -585,17 +597,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case fbTracksResolvedMsg:
 		if len(msg.tracks) == 0 {
-			m.status.Show("No audio files found", statusTTLDefault)
+			m.status.Warning("No audio files found", statusTTLDefault)
 			return m, nil
 		}
 		if msg.targetPlaylist != "" {
 			added, skipped, err := m.writeTracksToPlaylist(msg.targetPlaylist, msg.tracks)
 			if err != nil {
-				m.status.Showf(statusTTLDefault, "Add failed: %s", err)
+				m.status.Errorf(statusTTLDefault, "Add failed: %s", err)
 			} else if skipped > 0 {
-				m.status.Showf(statusTTLBatch, "Added %d to %q, skipped %d duplicates", added, msg.targetPlaylist, skipped)
-			} else {
+				m.status.Warningf(statusTTLBatch, "Added %d to %q, skipped %d duplicates", added, msg.targetPlaylist, skipped)
+			} else if added > 0 {
 				m.status.Showf(statusTTLDefault, "Added %d to %q", added, msg.targetPlaylist)
+			} else {
+				m.status.Warningf(statusTTLDefault, "Nothing added to %q", msg.targetPlaylist)
 			}
 			m.refreshPlaylistManagerAfterWrite(msg.targetPlaylist)
 			return m, nil
@@ -645,7 +659,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.err = msg.err
 			if track, idx := m.currentPlaybackTrack(); idx >= 0 {
-				m.status.Showf(statusTTLLong, "Couldn't play %s — track is gated, restricted, or unavailable.", track.DisplayName())
+				m.status.Errorf(statusTTLLong, "Couldn't play %s — track is gated, restricted, or unavailable.", track.DisplayName())
 			}
 		} else {
 			m.err = nil
@@ -666,7 +680,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ytdlSavedMsg:
 		m.save.finishDownload()
 		if msg.err != nil {
-			m.status.Showf(statusTTLMedium, "Download failed: %s", msg.err)
+			m.status.Errorf(statusTTLMedium, "Download failed: %s", msg.err)
 		} else {
 			m.status.Showf(statusTTLMedium, "Saved to %s", msg.path)
 		}
@@ -713,9 +727,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spotSearch.results = msg.tracks
 		m.spotSearch.cursor = 0
 		m.spotSearch.screen = spotSearchResults
-		if len(msg.tracks) == 0 {
-			m.spotSearch.err = "No results found"
-		}
 		m.applyHeightMode()
 		m.clampActiveScrollState()
 		return m, nil
@@ -791,7 +802,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case devicesListedMsg:
 		m.devicePicker.loading = false
 		if msg.err != nil {
-			m.status.Showf(statusTTLDefault, "Device list failed: %s", msg.err)
+			m.status.Errorf(statusTTLDefault, "Device list failed: %s", msg.err)
 			m.devicePicker.visible = false
 		} else {
 			m.devicePicker.devices = msg.devices
@@ -800,7 +811,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case deviceSwitchedMsg:
 		if msg.err != nil {
-			m.status.Showf(statusTTLDefault, "Switch failed: %s", msg.err)
+			m.status.Errorf(statusTTLDefault, "Switch failed: %s", msg.err)
 		} else {
 			m.status.Showf(statusTTLDefault, "Audio output: %s", msg.name)
 			_ = m.configSaver.Save("audio_device", msg.name)
@@ -872,6 +883,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case SetEQPresetMsg:
 		m.SetEQPreset(msg.Name, msg.Bands)
+		m.scheduleEQSave()
+		return m, nil
+
+	case SetEQBandMsg:
+		m.setCustomEQBand(msg.Band, msg.Gain)
 		return m, nil
 
 	case PluginQueueMsg:
@@ -1003,7 +1019,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		shuffled := m.playlist.Shuffled()
 		if err := m.configSaver.Save("shuffle", fmt.Sprintf("%v", shuffled)); err != nil {
-			m.status.Showf(statusTTLDefault, "Config save failed: %s", err)
+			m.status.Errorf(statusTTLDefault, "Config save failed: %s", err)
 		}
 		m.player.ClearPreload()
 		cmd := m.preloadNext()
@@ -1025,7 +1041,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		mode := m.playlist.Repeat()
 		if err := m.configSaver.Save("repeat", fmt.Sprintf("%q", mode.String())); err != nil {
-			m.status.Showf(statusTTLDefault, "Config save failed: %s", err)
+			m.status.Errorf(statusTTLDefault, "Config save failed: %s", err)
 		}
 		m.player.ClearPreload()
 		cmd := m.preloadNext()
@@ -1064,8 +1080,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ipc.EQMsg:
 		if msg.Band > 0 || (msg.Band == 0 && msg.Name == "") {
 			// Set a specific band (0-9).
-			m.player.SetEQBand(msg.Band, msg.Value)
-			m.scheduleEQSave()
+			m.setCustomEQBand(msg.Band, msg.Value)
 			if msg.Reply != nil {
 				msg.Reply <- ipc.Response{OK: true, EQPreset: m.EQPresetName()}
 			}
@@ -1158,6 +1173,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			t := m.themes[m.themeIdx]
 			resp.Theme = &ipc.ThemeInfo{
 				Name:     t.Name,
+				BG:       t.BG,
 				Accent:   t.Accent,
 				Fg:       t.FG,
 				BrightFg: t.BrightFG,
