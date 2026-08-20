@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 const (
@@ -16,7 +17,11 @@ const (
 	maxSpectrumHz        = 20000.0
 	// Cap on dt fed into smoothing easing — long gaps (sleep, paused, stalled
 	// frame) step like ~1 frame instead of integrating over a huge interval.
-	maxSmoothDtFrames = 10
+	maxSmoothDtFrames        = 10
+	maxAnimationCatchUpSteps = 4
+	// Band level below which paused spectrum content is treated as fully
+	// decayed to rest, letting the model drop the visualizer to the idle tick.
+	pausedDecayEpsilon = 0.01
 )
 
 var legacySpectrumEdges = [DefaultSpectrumBands + 1]float64{
@@ -401,7 +406,10 @@ type Visualizer struct {
 	Rows            int       // display height in terminal rows (default 5)
 	waveBuf         []float64 // raw samples for wave mode
 	waveYBuf        []int     // reusable y-position buffer for wave rendering
-	frame           uint64    // tick-driven animation clock
+	frame           uint64    // elapsed-time animation clock
+	lastFrameTick   time.Time // wall clock of the previous frame-accounting tick
+	frameElapsed    time.Duration
+	frameInterval   time.Duration
 	sampleBuf       []float64 // reusable buffer for reading audio tap samples
 	drivers         [VisCount]visModeDriver
 	activeMode      VisMode
@@ -871,12 +879,107 @@ func (v *Visualizer) Tick(ctx VisTickContext) {
 	}
 	v.refreshPending = false
 	if ctx.Paused {
+		// Keep easing the visual down to rest instead of freezing mid-frame.
+		// Drivers already know how to decay when not playing (silent band
+		// analysis, target-zero physics); we just keep ticking until settled.
+		if v.pausedSettled(driver, ctx) {
+			v.Suspend()
+		} else {
+			driver.Tick(v, ctx)
+		}
 		return
 	}
-	if v.Mode != VisNone && !ctx.OverlayActive {
-		v.frame++
+	if ctx.OverlayActive {
+		v.resetFrameTiming()
+	} else if v.Mode != VisNone {
+		v.frame += v.animationSteps(ctx.Now, driver.TickInterval(v, ctx))
 	}
 	driver.Tick(v, ctx)
+}
+
+// Suspend resets elapsed-time accounting and the active driver's wall clock so
+// resuming after a hidden or paused interval advances by one frame, not the gap.
+func (v *Visualizer) Suspend() {
+	if v == nil {
+		return
+	}
+	v.resetFrameTiming()
+	driver := v.syncDriverMode()
+	if driver != nil {
+		driver.Tick(v, VisTickContext{OverlayActive: true})
+	}
+}
+
+func (v *Visualizer) resetFrameTiming() {
+	v.lastFrameTick = time.Time{}
+	v.frameElapsed = 0
+	v.frameInterval = 0
+}
+
+// pausedSettled reports whether a paused visualizer has no content left to
+// ease down, so it can freeze at rest. Band-driven modes must empty both the
+// raw and smoothed bands; drivers with their own physics (classic peak/LED,
+// stereo) stay active until their internal animation settles, which they
+// signal with a fast tick interval even when not playing.
+func (v *Visualizer) pausedSettled(driver visModeDriver, ctx VisTickContext) bool {
+	if v == nil || driver == nil {
+		return true
+	}
+	if spec := NormalizeAnalysisSpec(driver.AnalysisSpec(v)); spec.BandCount > 0 {
+		for _, b := range v.bands {
+			if b >= pausedDecayEpsilon {
+				return false
+			}
+		}
+		for _, b := range v.smoothedBands {
+			if b >= pausedDecayEpsilon {
+				return false
+			}
+		}
+	}
+	ctx.Playing = false
+	return driver.TickInterval(v, ctx) >= TickSlow
+}
+
+// PausedDecayPending reports whether a paused visualizer still needs ticks to
+// settle its content to rest. The model uses it to keep the slow tick cadence
+// instead of dropping to fully idle while bars ease down.
+func (v *Visualizer) PausedDecayPending(ctx VisTickContext) bool {
+	driver := v.syncDriverMode()
+	if driver == nil {
+		return false
+	}
+	return !v.pausedSettled(driver, ctx)
+}
+
+func (v *Visualizer) animationSteps(now time.Time, interval time.Duration) uint64 {
+	// Drivers at the normal UI cadence retain the existing one-frame-per-tick
+	// behavior. Only faster logical clocks need elapsed-time catch-up.
+	if interval <= 0 || interval >= TickFast || now.IsZero() {
+		v.resetFrameTiming()
+		return 1
+	}
+	if v.lastFrameTick.IsZero() || v.frameInterval != interval {
+		v.lastFrameTick = now
+		v.frameElapsed = 0
+		v.frameInterval = interval
+		return 1
+	}
+
+	dt := now.Sub(v.lastFrameTick)
+	v.lastFrameTick = now
+	if dt <= 0 {
+		return 0
+	}
+	v.frameElapsed += dt
+	steps := int(v.frameElapsed / interval)
+	if steps > maxAnimationCatchUpSteps {
+		steps = maxAnimationCatchUpSteps
+		v.frameElapsed %= interval
+	} else {
+		v.frameElapsed -= time.Duration(steps) * interval
+	}
+	return uint64(steps)
 }
 
 func (v *Visualizer) driverFor(mode VisMode) visModeDriver {
@@ -932,14 +1035,46 @@ func fitVisualizerFrame(frame string, cols, rows int) string {
 		return ""
 	}
 
-	lines := strings.Split(FitRect(frame, cols, rows), "\n")
-	for len(lines) < rows {
-		lines = append(lines, "")
+	var out strings.Builder
+	out.Grow(rows*(cols+1) - 1)
+	rest := frame
+	for row := range rows {
+		if row > 0 {
+			out.WriteByte('\n')
+		}
+		line, next, _ := strings.Cut(rest, "\n")
+		width := writeVisualizerLine(&out, line, cols)
+		for range cols - width {
+			out.WriteByte(' ')
+		}
+		rest = next
 	}
-	for i, line := range lines {
-		lines[i] = line + strings.Repeat(" ", max(0, cols-lipgloss.Width(line)))
+	return out.String()
+}
+
+func writeVisualizerLine(out *strings.Builder, line string, cols int) int {
+	width := 0
+	clipped := false
+	var state byte
+	for len(line) > 0 {
+		seq, seqWidth, n, nextState := ansi.DecodeSequence(line, state, nil)
+		if n == 0 {
+			seq, n, nextState = line[:1], 1, ansi.NormalState
+		}
+		state = nextState
+		line = line[n:]
+
+		if !clipped && width+seqWidth <= cols {
+			out.WriteString(seq)
+			width += seqWidth
+			continue
+		}
+		clipped = true
+		if len(seq) > 0 && (seq[0] == ansi.ESC || seq[0] >= ansi.PAD && seq[0] <= ansi.APC) {
+			out.WriteString(seq)
+		}
 	}
-	return strings.Join(lines, "\n")
+	return width
 }
 
 func (d *luaModeDriver) Tick(v *Visualizer, ctx VisTickContext) {

@@ -97,6 +97,86 @@ func TestSmoothBarsDriverUsesAnimTick(t *testing.T) {
 	}
 }
 
+func TestFastFrameDriverTracksWallClockAtNormalUICadence(t *testing.T) {
+	v := NewVisualizer(44100)
+	v.Mode = VisScope
+	v.Cols = 80
+	t0 := time.Unix(1, 0)
+	v.Tick(VisTickContext{Now: t0, Playing: true})
+
+	const ticks = 20
+	for i := 1; i <= ticks; i++ {
+		v.Tick(VisTickContext{Now: t0.Add(time.Duration(i) * TickFast), Playing: true})
+	}
+
+	want := uint64(1 + time.Duration(ticks)*TickFast/TickAnim)
+	if got := v.Frame(); got != want {
+		t.Fatalf("Scope frame after %v = %d, want %d", time.Duration(ticks)*TickFast, got, want)
+	}
+}
+
+func TestNormalFrameDriverAdvancesOncePerTick(t *testing.T) {
+	v := NewVisualizer(44100)
+	v.Mode = VisPulse
+	v.Cols = 80
+	t0 := time.Unix(1, 0)
+
+	for i := range 5 {
+		v.Tick(VisTickContext{Now: t0.Add(time.Duration(i) * TickFast), Playing: true})
+		if got, want := v.Frame(), uint64(i+1); got != want {
+			t.Fatalf("Pulse frame after tick %d = %d, want %d", i+1, got, want)
+		}
+	}
+}
+
+func TestFastFrameDriverBoundsCatchUp(t *testing.T) {
+	v := NewVisualizer(44100)
+	v.Mode = VisScope
+	v.Cols = 80
+	t0 := time.Unix(1, 0)
+	v.Tick(VisTickContext{Now: t0, Playing: true})
+	v.Tick(VisTickContext{Now: t0.Add(time.Second), Playing: true})
+
+	want := uint64(1 + maxAnimationCatchUpSteps)
+	if got := v.Frame(); got != want {
+		t.Fatalf("Scope frame after stalled tick = %d, want bounded catch-up to %d", got, want)
+	}
+}
+
+func TestFastFrameDriverDoesNotCatchUpPausedOrHiddenTime(t *testing.T) {
+	tests := []struct {
+		name    string
+		suspend func(*Visualizer, time.Time)
+	}{
+		{
+			name: "paused",
+			suspend: func(v *Visualizer, now time.Time) {
+				v.Tick(VisTickContext{Now: now, Playing: true, Paused: true})
+			},
+		},
+		{name: "hidden", suspend: func(v *Visualizer, _ time.Time) { v.Suspend() }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := NewVisualizer(44100)
+			v.Mode = VisScope
+			v.Cols = 80
+			t0 := time.Unix(1, 0)
+			v.Tick(VisTickContext{Now: t0, Playing: true})
+			v.Tick(VisTickContext{Now: t0.Add(TickFast), Playing: true})
+			before := v.Frame()
+
+			tt.suspend(v, t0.Add(2*TickFast))
+			v.Tick(VisTickContext{Now: t0.Add(2 * time.Second), Playing: true})
+
+			if got := v.Frame(); got != before+1 {
+				t.Fatalf("Scope frame after resume = %d, want %d", got, before+1)
+			}
+		})
+	}
+}
+
 func TestAdvanceSmoothingEasesTowardBands(t *testing.T) {
 	v := NewVisualizer(44100)
 	v.bands = []float64{1.0, 0.0}
@@ -134,6 +214,60 @@ func TestAdvanceSmoothingResizesOnBandCountChange(t *testing.T) {
 	for i, got := range v.smoothedBands {
 		if got != v.bands[i] {
 			t.Fatalf("smoothedBands[%d] = %v, want %v after resync", i, got, v.bands[i])
+		}
+	}
+}
+
+func TestPausedBarsDecayToRestThenSuspend(t *testing.T) {
+	withPanelWidth(t, 16)
+
+	v := NewVisualizer(44100)
+	activateMode(t, v, VisBars)
+	v.bands = uniformBands(0.8)
+	v.smoothedBands = append([]float64(nil), v.bands...)
+
+	analyze := func(spec VisAnalysisSpec) []float64 {
+		return v.Analyze(nil, spec)
+	}
+	ctxAt := func(now time.Time) VisTickContext {
+		return VisTickContext{Now: now, Paused: true, Analyze: analyze}
+	}
+
+	prev := append([]float64(nil), v.SmoothedBands()...)
+	settled := false
+	now := time.Unix(1, 0)
+	for i := 0; i < 240; i++ {
+		v.Tick(ctxAt(now.Add(time.Duration(i+1) * TickSlow)))
+		cur := v.SmoothedBands()
+		for b := range len(cur) {
+			if cur[b] > prev[b]+1e-9 {
+				t.Fatalf("paused tick %d band %d rose %v -> %v, want monotonic decay", i, b, prev[b], cur[b])
+			}
+		}
+		prev = append(prev[:0], cur...)
+		if !v.PausedDecayPending(ctxAt(now.Add(time.Duration(i+2) * TickSlow))) {
+			settled = true
+			break
+		}
+	}
+	if !settled {
+		t.Fatal("paused bars never settled to rest")
+	}
+	for i, got := range prev {
+		if got >= pausedDecayEpsilon {
+			t.Fatalf("band %d = %v after decay, want below %v", i, got, pausedDecayEpsilon)
+		}
+	}
+
+	// Once settled, further paused ticks suspend and leave the frame alone.
+	frameBefore := v.Frame()
+	v.Tick(ctxAt(now.Add(10 * time.Second)))
+	if got := v.Frame(); got != frameBefore {
+		t.Fatalf("settled paused tick advanced frame %d -> %d", frameBefore, got)
+	}
+	for i, got := range v.SmoothedBands() {
+		if math.Abs(got-prev[i]) > 1e-9 {
+			t.Fatalf("settled paused tick changed band %d %v -> %v", i, prev[i], got)
 		}
 	}
 }

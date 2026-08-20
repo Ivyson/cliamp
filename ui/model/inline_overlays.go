@@ -83,6 +83,25 @@ func bodyMessage(msg string, budget int) string {
 	return bodyLines([]string{dimStyle.Render("  " + msg)}, budget)
 }
 
+// renderSpotSearchResults renders the search results grouped into labeled
+// sections, so albums are visibly a different kind of result than the tracks
+// below them rather than one long undifferentiated list.
+func (m Model) renderSpotSearchResults(budget int) string {
+	lines := make([]string, 0, budget)
+	for row := range spotSearchRows(m.spotSearch.results, m.spotSearch.scroll) {
+		if len(lines) >= budget {
+			break
+		}
+		if row.Index < 0 {
+			lines = append(lines, dimStyle.Render(labeledSeparator("", row.Section)))
+			continue
+		}
+		label := truncate(fmt.Sprintf("%s - %s", row.Track.Artist, row.Track.Title), ui.PanelWidth-8)
+		lines = append(lines, cursorLine(label, row.Index == m.spotSearch.cursor))
+	}
+	return strings.Join(padLines(lines, budget, len(lines)), "\n")
+}
+
 // renderTrackRowsBody renders a track list with album-header separators into
 // the playlist-region budget, highlighting the row at cursor. Shared by the
 // nav browser and playlist manager unfiltered track views.
@@ -255,15 +274,19 @@ func (m Model) renderDeviceBody() string {
 
 func (m Model) renderQueueBody() string {
 	budget := m.effectivePlaylistVisible()
-	tracks := m.playlist.QueueTracks()
-	if len(tracks) == 0 {
+	if budget <= 0 {
+		return ""
+	}
+	if m.playlist.QueueLen() == 0 {
 		return bodyMessage("(empty)", budget)
 	}
+	start := max(0, m.queue.scroll)
+	tracks := m.playlist.QueueWindow(start, budget)
 	items := make([]string, len(tracks))
 	for i, t := range tracks {
-		items[i] = fmt.Sprintf("%d. %s", i+1, truncate(t.DisplayName(), ui.PanelWidth-8))
+		items[i] = fmt.Sprintf("%d. %s", start+i+1, truncate(t.DisplayName(), ui.PanelWidth-8))
 	}
-	return windowList(items, m.queue.cursor, m.queue.scroll, budget)
+	return windowList(items, m.queue.cursor-start, 0, budget)
 }
 
 // — track info —
@@ -492,14 +515,13 @@ func (m Model) renderSpotSearchBody() string {
 	var body string
 	switch m.spotSearch.screen {
 	case spotSearchResults:
-		if len(m.spotSearch.results) == 0 {
+		switch {
+		case m.spotSearch.albumLoading:
+			body = bodyLines([]string{loadingLine("Loading album…")}, budget)
+		case len(m.spotSearch.results) == 0:
 			body = bodyMessage("No results", budget)
-		} else {
-			items := make([]string, len(m.spotSearch.results))
-			for i, t := range m.spotSearch.results {
-				items[i] = truncate(fmt.Sprintf("%s - %s", t.Artist, t.Title), ui.PanelWidth-8)
-			}
-			body = windowList(items, m.spotSearch.cursor, m.spotSearch.scroll, budget)
+		default:
+			body = m.renderSpotSearchResults(budget)
 		}
 	case spotSearchPlaylist:
 		if m.spotSearch.loading {

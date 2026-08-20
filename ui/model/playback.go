@@ -14,6 +14,11 @@ import (
 
 const ytdlReconnectPauseThreshold = 45 * time.Second
 
+func (m *Model) replacePlaylist(tracks []playlist.Track) {
+	m.playlist.Replace(tracks)
+	m.normalizeQueueOverlay()
+}
+
 // nextTrack advances to the next playlist track and starts playing it.
 // Unplayable tracks are skipped automatically.
 func (m *Model) nextTrack() tea.Cmd {
@@ -27,6 +32,7 @@ func (m *Model) nextTrack() tea.Cmd {
 		return m.playCurrentTrack()
 	}
 	track, ok := m.playlist.Next()
+	m.normalizeQueueOverlay()
 	if !ok {
 		m.player.Stop()
 		m.clearPlaybackTrack()
@@ -133,6 +139,64 @@ func (m *Model) appendTrack(track playlist.Track) tea.Cmd {
 	return nil
 }
 
+// playAlbumImmediate appends an expanded album to the queue and starts it at
+// its first track. Like playTrackImmediate it adds rather than replaces, so a
+// queue built up over an evening survives picking an album from search.
+func (m *Model) playAlbumImmediate(album playlist.Track, tracks []playlist.Track) tea.Cmd {
+	m.player.Stop()
+	m.player.ClearPreload()
+	idx := m.playlist.Len()
+	m.playlist.Add(tracks...)
+	m.loadedPlaylist = ""
+	m.addToHeaderState(tracks)
+	m.playlist.SetIndex(idx)
+	m.plCursor = idx
+	m.adjustScroll()
+	m.status.Showf(statusTTLMedium, "Playing album: %s (%d tracks)", album.Title, len(tracks))
+	cmd := m.playCurrentTrack()
+	m.notifyPlayback()
+	return cmd
+}
+
+// appendAlbum appends an expanded album to the queue; auto-plays from its first
+// track if nothing is playing.
+func (m *Model) appendAlbum(album playlist.Track, tracks []playlist.Track) tea.Cmd {
+	wasEmpty := m.playlist.Len() == 0
+	idx := m.playlist.Len()
+	m.playlist.Add(tracks...)
+	m.loadedPlaylist = ""
+	m.addToHeaderState(tracks)
+	m.status.Showf(statusTTLMedium, "Added album: %s (%d tracks)", album.Title, len(tracks))
+	if wasEmpty || !m.player.IsPlaying() {
+		m.playlist.SetIndex(idx)
+		m.plCursor = idx
+		m.adjustScroll()
+		cmd := m.playCurrentTrack()
+		m.notifyPlayback()
+		return cmd
+	}
+	return nil
+}
+
+// queueAlbumNext queues a whole album to play after the current track, keeping
+// its running order.
+func (m *Model) queueAlbumNext(album playlist.Track, tracks []playlist.Track) tea.Cmd {
+	idx := m.playlist.Len()
+	m.playlist.Add(tracks...)
+	m.loadedPlaylist = ""
+	m.addToHeaderState(tracks)
+	for i := range tracks {
+		m.playlist.Queue(idx + i)
+	}
+	m.status.Showf(statusTTLMedium, "Queued album: %s (%d tracks)", album.Title, len(tracks))
+	if !m.player.IsPlaying() {
+		cmd := m.nextTrack()
+		m.notifyPlayback()
+		return cmd
+	}
+	return nil
+}
+
 // closeNetSearch fully resets the net search overlay and restores focus,
 // dropping any cached results so they don't linger between sessions.
 func (m *Model) closeNetSearch() {
@@ -172,6 +236,7 @@ func (m *Model) queueTrackNext(track playlist.Track) tea.Cmd {
 	m.addToHeaderState([]playlist.Track{track})
 	idx := m.playlist.Len() - 1
 	m.playlist.Queue(idx)
+	m.normalizeQueueOverlay()
 	m.status.Showf(statusTTLMedium, "Queued: %s", track.DisplayName())
 	if !m.player.IsPlaying() {
 		cmd := m.nextTrack()
@@ -190,7 +255,10 @@ func (m *Model) removeSelectedFromPlaylist() {
 		return
 	}
 	snapshot := m.playlist.Snapshot()
-	track := m.playlist.Tracks()[idx]
+	track, ok := m.playlist.Track(idx)
+	if !ok {
+		return
+	}
 	if track.DirSourced {
 		m.status.Warningf(statusTTLDefault, "Can't remove %q: it's supplied by the playlist's directory source", track.DisplayName())
 		return
@@ -234,6 +302,7 @@ func (m *Model) removeSelectedFromPlaylist() {
 	if !m.playlist.Remove(idx) {
 		return
 	}
+	m.normalizeQueueOverlay()
 	m.playlistUndo = playlistUndo{active: true, snapshot: snapshot, loaded: loaded, saved: saved, persisted: persisted}
 	if wasActive {
 		m.player.Stop()
@@ -272,6 +341,7 @@ func (m *Model) undoPlaylistMutation() {
 		}
 	}
 	m.playlist.Restore(undo.snapshot)
+	m.normalizeQueueOverlay()
 	m.playlistUndo = playlistUndo{}
 	if m.plCursor >= m.playlist.Len() {
 		m.plCursor = max(0, m.playlist.Len()-1)

@@ -24,14 +24,38 @@ func tickCmdAt(d time.Duration) tea.Cmd {
 	})
 }
 
+func (m Model) visualizerVisible() bool {
+	if m.vis == nil || m.vis.Mode == ui.VisNone || m.vis.Rows <= 0 || m.vis.Cols <= 0 || m.layout.tooSmall() {
+		return false
+	}
+	if m.fullVis {
+		return true
+	}
+	return m.layout.visualizerRows > 0 && !m.usesContentFirstLayout()
+}
+
 func (m *Model) visualizerPlaying() bool {
-	return m.player != nil && m.vis != nil && m.vis.Mode != ui.VisNone &&
+	return m.player != nil && m.visualizerVisible() &&
 		!m.isOverlayActive() && m.player.IsPlaying() && !m.player.IsPaused()
 }
 
 func (m *Model) visualizerPaused() bool {
-	return m.player != nil && m.vis != nil && m.vis.Mode != ui.VisNone &&
+	return m.player != nil && m.visualizerVisible() &&
 		!m.isOverlayActive() && m.player.IsPlaying() && m.player.IsPaused()
+}
+
+// visualizerSettlingPaused reports whether playback is paused and the
+// visualizer still has spectrum content easing to zero. While true the tick
+// stays above the idle cadence so the bars fall; once settled the model can
+// return to the fully-idle cadence.
+func (m *Model) visualizerSettlingPaused() bool {
+	if m.player == nil || !m.player.IsPaused() || m.isOverlayActive() {
+		return false
+	}
+	if !m.visualizerVisible() {
+		return false
+	}
+	return m.vis.PausedDecayPending(m.visualizerTickContext(time.Time{}))
 }
 
 func (m *Model) visualizerTickContext(now time.Time) ui.VisTickContext {
@@ -71,6 +95,14 @@ func (m *Model) visualizerTickContext(now time.Time) ui.VisTickContext {
 				return nil
 			}
 			if bands, ok := cache[spec]; ok {
+				return bands
+			}
+			if m.player.IsPaused() {
+				// Paused playback yields no new samples; feed silence so
+				// spectrum content eases down to rest instead of freezing on
+				// the last played frame held in the audio tap.
+				bands := m.vis.Analyze(nil, spec)
+				cache[spec] = bands
 				return bands
 			}
 			buf := m.vis.EnsureSampleBuf(spec.FFTSize)
@@ -137,7 +169,7 @@ func (m *Model) tickInterval() time.Duration {
 		return ui.TickIdle
 	}
 	d := ui.TickSlow
-	if m.vis != nil {
+	if m.visualizerVisible() {
 		d = m.vis.TickInterval(m.visualizerTickContext(time.Time{}))
 	}
 	// Keep the seek bar / time counter smooth while audio is playing, even
@@ -145,13 +177,19 @@ func (m *Model) tickInterval() time.Duration {
 	// idle, etc.). Overlays, paused, and stopped playback keep the slower
 	// cadence to save CPU.
 	if !m.isOverlayActive() && !m.buffering && m.player != nil &&
-		m.player.IsPlaying() && !m.player.IsPaused() && d > ui.TickFast {
+		m.player.IsPlaying() && !m.player.IsPaused() {
 		if m.lowPower {
 			return ui.TickLowPowerPlaying
 		}
-		d = ui.TickFast
+		return ui.TickFast
 	}
-	return d
+	// Paused visualizer content still easing to rest: run at the fast cadence
+	// so the bars fall smoothly instead of in ~5 fps steps, then drop to idle
+	// once the content has settled.
+	if m.visualizerSettlingPaused() {
+		return ui.TickFast
+	}
+	return max(d, ui.TickFast)
 }
 
 // isFullyIdle reports whether the model has nothing changing on its own.
@@ -162,6 +200,9 @@ func (m *Model) isFullyIdle() bool {
 		return false
 	}
 	if m.player.IsPlaying() && !m.player.IsPaused() {
+		return false
+	}
+	if m.visualizerSettlingPaused() {
 		return false
 	}
 	if m.isOverlayActive() || m.buffering || m.termTitle.introActive {
@@ -177,20 +218,31 @@ func (m *Model) isFullyIdle() bool {
 }
 
 func (m *Model) tickVisualizer(now time.Time) {
-	if m.vis == nil || m.vis.Mode == ui.VisNone {
+	if m.vis == nil {
+		return
+	}
+	if !m.visualizerVisible() {
+		m.vis.Suspend()
 		return
 	}
 	m.vis.Tick(m.visualizerTickContext(now))
 }
 
 func (m Model) refreshVisualizerIfPending() {
-	if m.vis == nil || m.vis.Mode == ui.VisNone || m.activeScreen().hidesVisualizer() || !m.vis.ConsumeRefresh() {
+	if m.vis == nil {
+		return
+	}
+	if !m.visualizerVisible() {
+		m.vis.Suspend()
+		return
+	}
+	if !m.vis.ConsumeRefresh() {
 		return
 	}
 	m.tickVisualizer(time.Now())
 }
 
-func (m Model) maybeRequestVisualizerRefresh(msg tea.Msg, wasScreen topLevelScreen, wasMode ui.VisMode, wasPlaying, wasPaused bool) {
+func (m Model) maybeRequestVisualizerRefresh(msg tea.Msg, wasScreen topLevelScreen, wasVisible bool, wasMode ui.VisMode, wasPlaying, wasPaused bool) {
 	if m.vis == nil {
 		return
 	}
@@ -198,7 +250,8 @@ func (m Model) maybeRequestVisualizerRefresh(msg tea.Msg, wasScreen topLevelScre
 		return
 	}
 	screen := m.activeScreen()
-	if screen.hidesVisualizer() || m.vis.Mode == ui.VisNone {
+	if !m.visualizerVisible() {
+		m.vis.Suspend()
 		return
 	}
 
@@ -208,8 +261,13 @@ func (m Model) maybeRequestVisualizerRefresh(msg tea.Msg, wasScreen topLevelScre
 		playing = m.player.IsPlaying()
 		paused = m.player.IsPaused()
 	}
+	if paused {
+		m.vis.Suspend()
+		return
+	}
 
-	if wasScreen != screen ||
+	if !wasVisible ||
+		wasScreen != screen ||
 		wasMode != m.vis.Mode ||
 		(!wasPlaying && playing) ||
 		(wasPaused && !paused) {

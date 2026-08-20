@@ -139,6 +139,7 @@ type plManagerState struct {
 	playlists     []playlist.PlaylistInfo
 	selPlaylist   string           // playlist name open in screen 1
 	tracks        []playlist.Track // tracks in the selected playlist
+	missingLocal  []bool           // cached missing-file state, indexed with tracks
 	newName       string
 	confirmDel    bool
 	renameOldName string
@@ -166,9 +167,10 @@ const (
 )
 
 type plManagerUndo struct {
-	kind   plManagerUndoKind
-	name   string
-	tracks []playlist.Track
+	kind         plManagerUndoKind
+	name         string
+	tracks       []playlist.Track
+	missingLocal []bool
 }
 
 type playlistPickerScreen int
@@ -242,6 +244,7 @@ type requestState struct {
 	lyrics       uint64
 	netSearch    uint64
 	spotSearch   uint64
+	spotAlbum    uint64
 	spotLists    uint64
 	spotMutation uint64
 	auth         uint64
@@ -267,19 +270,22 @@ const (
 
 // spotSearchState holds state for the provider search + add-to-playlist overlay.
 type spotSearchState struct {
-	prov      playlist.Provider // the provider being searched (may differ from active provider)
-	visible   bool
-	screen    spotSearchScreenType
-	query     string
-	results   []playlist.Track
-	cursor    int
-	scroll    int
-	loading   bool
-	playlists []playlist.PlaylistInfo // user's Spotify playlists for picker
-	selTrack  playlist.Track          // track selected to add
-	newName   string                  // new playlist name input
-	err       string
-	cancel    func()
+	prov    playlist.Provider // the provider being searched (may differ from active provider)
+	visible bool
+	screen  spotSearchScreenType
+	query   string
+	results []playlist.Track
+	cursor  int
+	scroll  int
+	loading bool
+	// albumLoading is separate from loading so the results screen can say an
+	// album is being expanded without claiming so during the playlist fetch.
+	albumLoading bool
+	playlists    []playlist.PlaylistInfo // user's Spotify playlists for picker
+	selTrack     playlist.Track          // track selected to add
+	newName      string                  // new playlist name input
+	err          string
+	cancel       func()
 }
 
 // catalogBatchState holds state for lazy-loading catalog entries from a provider.CatalogLoader.
