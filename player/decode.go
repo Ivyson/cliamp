@@ -96,6 +96,12 @@ func openSSHSource(path string) (sourceResult, error) {
 		return sourceResult{}, err
 	}
 
+	// Defense-in-depth: reject hosts that start with - or contain =, which would
+	// indicate ssh option injection (e.g. -oProxyCommand=...) injected via the URL host.
+	if strings.HasPrefix(parsed.Host, "-") || strings.Contains(parsed.Host, "=") {
+		return sourceResult{}, fmt.Errorf("invalid ssh URL %q: host %q contains disallowed characters", path, parsed.Host)
+	}
+
 	catCmd := "cat -- " + shellQuoteSSH(parsed.Path)
 	args := parsed.SSHArgs()
 	args = append(args, catCmd)
